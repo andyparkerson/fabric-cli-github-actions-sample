@@ -1,0 +1,693 @@
+name: Fabric CLI CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+# Prevent concurrent deployments to the same workspace
+concurrency:
+  group: fabric-deployment-${{ vars.WORKSPACE_NAME }}
+  cancel-in-progress: false  # Don't cancel running deployments
+
+permissions:
+  id-token: write   # Required for requesting the JWT
+  contents: read    # Required for actions/checkout
+
+env:
+  PYTHON_VERSION: "3.12"
+  FABRIC_CLI_VERSION: "ms-fabric-cli"
+
+jobs:
+  validate-and-plan:
+    name: Validate Changes and Plan Deployment
+    runs-on: ubuntu-latest
+    timeout-minutes: 10  # Reduced timeout for validation jobs
+    outputs:
+      skip-deployment: ${{ steps.identify-changes.outputs.skip-deployment }}
+      semantic-models: ${{ steps.identify-changes.outputs.semantic-models }}
+      reports: ${{ steps.identify-changes.outputs.reports }}
+      workspace-id: ${{ steps.workspace-info.outputs.workspace-id }}
+    
+    steps:
+      - name: Check out the code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Fetch full history to avoid git diff issues
+
+      # Use latest action versions for security and performance
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      # Cache dependencies to improve build performance
+      - name: Cache Python dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-fabric-cli
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install Fabric CLI
+        run: |
+          set -e
+          python -m pip install --upgrade pip
+          python -m pip install ${{ env.FABRIC_CLI_VERSION }}
+
+      # Comprehensive input validation with format checking
+      - name: Validate inputs
+        env:
+          CLIENT_ID: ${{ secrets.CLIENT_ID }}
+          CLIENT_SECRET: ${{ secrets.CLIENT_SECRET }}
+          TENANT_ID: ${{ secrets.TENANT_ID }}
+          WORKSPACE_NAME: ${{ vars.WORKSPACE_NAME }}
+        run: |
+          set -e
+          echo "🔍 Validating environment variables and input formats..."
+          
+          # Validate workspace name format
+          if [[ ! "$WORKSPACE_NAME" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+            echo "::error::Invalid workspace name format. Only alphanumeric characters, underscores, and hyphens are allowed."
+            exit 1
+          fi
+          
+          # Validate tenant ID format (GUID)
+          if [[ ! "$TENANT_ID" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then
+            echo "::error::Invalid tenant ID format. Expected GUID format."
+            exit 1
+          fi
+          
+          # Validate client ID format (GUID)
+          if [[ ! "$CLIENT_ID" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then
+            echo "::error::Invalid client ID format. Expected GUID format."
+            exit 1
+          fi
+          
+          # Check required variables are present
+          required_vars=("CLIENT_ID" "CLIENT_SECRET" "TENANT_ID" "WORKSPACE_NAME")
+          missing_vars=()
+          
+          for var in "${required_vars[@]}"; do
+            if [[ -z "${!var}" ]]; then
+              missing_vars+=("$var")
+            fi
+          done
+          
+          if [[ ${#missing_vars[@]} -gt 0 ]]; then
+            echo "::error::Missing required environment variables: ${missing_vars[*]}"
+            exit 1
+          fi
+          
+          echo "✅ All environment variables validated successfully"
+          echo "📊 Tenant ID: $TENANT_ID"
+          echo "🔑 Client ID: $CLIENT_ID"
+          echo "🏢 Workspace: $WORKSPACE_NAME"
+
+      # Authentication with retry mechanism for reliability
+      - name: Authenticate with Fabric CLI (with retry)
+        id: fabric-login
+        env:
+          CLIENT_ID: ${{ secrets.CLIENT_ID }}
+          CLIENT_SECRET: ${{ secrets.CLIENT_SECRET }}
+          TENANT_ID: ${{ secrets.TENANT_ID }}
+        run: |
+          set -e
+          echo "🔐 Configuring Fabric CLI..."
+          fab config set encryption_fallback_enabled true
+          
+          # Retry authentication up to 3 times
+          for i in {1..3}; do
+            echo "🚀 Authentication attempt $i/3..."
+            if fab auth login -u "$CLIENT_ID" -p "$CLIENT_SECRET" --tenant "$TENANT_ID"; then
+              echo "✅ Authentication successful"
+              echo "📋 Testing connection..."
+              fab ls
+              break
+            elif [[ $i -eq 3 ]]; then
+              echo "::error::❌ Authentication failed after 3 attempts"
+              exit 1
+            else
+              echo "⚠️ Authentication attempt $i failed, retrying in 5 seconds..."
+              sleep 5
+            fi
+          done
+
+      - name: Get Workspace Information
+        id: workspace-info
+        env:
+          WORKSPACE_NAME: ${{ vars.WORKSPACE_NAME }}
+        run: |
+          set -e
+          echo "🏢 Getting workspace information for: $WORKSPACE_NAME"
+          echo "🌐 Endpoint: Fabric CLI - Getting workspace details via fabric API"
+          
+          if ! workspace_id=$(fab get "$WORKSPACE_NAME.Workspace" -q id); then
+            echo "::error::❌ Failed to retrieve workspace ID for: $WORKSPACE_NAME"
+            exit 1
+          fi
+          
+          # Clean workspace_id to remove any carriage returns or whitespace
+          workspace_id=$(echo "$workspace_id" | tr -d '\r\n' | xargs)
+          
+          echo "✅ Workspace ID: $workspace_id"
+          echo "workspace-id=$workspace_id" >> $GITHUB_OUTPUT
+          echo "WORKSPACE_ID=$workspace_id" >> $GITHUB_ENV
+
+      # Enhanced change detection with proper folder identification
+      - name: Identify Changes For Promotion
+        id: identify-changes
+        run: |
+          set -e
+          echo "🔍 Identifying changes for promotion..."
+
+          # Function to find parent folders containing specific file patterns
+          find_parent_folders() {
+            local changes="$1"
+            local filter="$2"
+            local paths=""
+            
+            for change in $changes; do
+              if [[ -n "$change" ]]; then
+                parent_folder=$(dirname "$change")
+                while [[ "$parent_folder" != "." && "$parent_folder" != "/" ]]; do
+                  if ls "$parent_folder"/$filter 1> /dev/null 2>&1; then
+                    paths="$paths $parent_folder"
+                    break
+                  fi
+                  parent_folder=$(dirname "$parent_folder")
+                done
+              fi
+            done
+            
+            echo "$paths" | tr ' ' '\n' | sort -u | tr '\n' ' ' | xargs
+          }
+
+          # Determine the comparison base
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            BASE_REF="${{ github.event.pull_request.base.sha }}"
+            HEAD_REF="${{ github.event.pull_request.head.sha }}"
+            echo "📊 PR detected - comparing $BASE_REF..$HEAD_REF"
+          else
+            # For push events, compare with previous commit
+            BASE_REF="HEAD~1"
+            HEAD_REF="HEAD"
+            echo "📊 Push event - comparing $BASE_REF..$HEAD_REF"
+          fi
+
+          # Check if we can perform the comparison
+          if ! git rev-parse --verify "$BASE_REF" >/dev/null 2>&1; then
+            echo "⚠️ Cannot compare with $BASE_REF. Analyzing all files..."
+            pbip_sm_changes=$(find . -path '*.Dataset/**' -o -path '*.SemanticModel/**' | grep -v '^\.git' || true)
+            pbip_rpt_changes=$(find . -path '*.Report/**' | grep -v '^\.git' || true)
+          else
+            # Get changes between commits
+            pbip_sm_changes=$(git diff --name-only --diff-filter=d "$BASE_REF..$HEAD_REF" -- '*.Dataset/**' '*.SemanticModel/**' || true)
+            pbip_rpt_changes=$(git diff --name-only --diff-filter=d "$BASE_REF..$HEAD_REF" -- '*.Report/**' || true)
+          fi
+
+          echo "📈 Raw semantic model changes: $pbip_sm_changes"
+          echo "📊 Raw report changes: $pbip_rpt_changes"
+
+          # Find semantic model folders to promote
+          sm_folders=$(find_parent_folders "$pbip_sm_changes" "*.pbism")
+          rpt_folders=$(find_parent_folders "$pbip_rpt_changes" "*.pbir")
+
+          echo "📁 Semantic model folders to promote: $sm_folders"
+          echo "📁 Report folders to promote: $rpt_folders"
+
+          # Set outputs and environment variables
+          if [[ -z "${sm_folders// }" && -z "${rpt_folders// }" ]]; then
+            echo "✨ No changes detected. Skipping deployment."
+            echo "skip-deployment=true" >> $GITHUB_OUTPUT
+            echo "SKIP_DEPLOYMENT=true" >> $GITHUB_ENV
+          else
+            echo "skip-deployment=false" >> $GITHUB_OUTPUT
+            echo "semantic-models=$sm_folders" >> $GITHUB_OUTPUT
+            echo "reports=$rpt_folders" >> $GITHUB_OUTPUT
+            echo "SEMANTIC_MODEL_FOLDERS=$sm_folders" >> $GITHUB_ENV
+            echo "REPORT_FOLDERS=$rpt_folders" >> $GITHUB_ENV
+          fi
+
+      - name: Upload validation artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: validation-logs
+          path: |
+            ~/.fabric/
+            *.log
+
+  deploy-semantic-models:
+    name: Deploy Semantic Models
+    needs: validate-and-plan
+    if: needs.validate-and-plan.outputs.skip-deployment != 'true' && needs.validate-and-plan.outputs.semantic-models != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 30  # Extended timeout for deployment operations
+    outputs:
+      semantic-model-ids: ${{ steps.deploy-models.outputs.semantic-model-ids }}
+    
+    steps:
+      - name: Check out the code
+        uses: actions/checkout@v4
+
+      # Use latest action versions for security and performance
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      # Cache dependencies to improve build performance
+      - name: Cache Python dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-fabric-cli
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install Fabric CLI
+        run: |
+          set -e
+          python -m pip install --upgrade pip
+          python -m pip install ${{ env.FABRIC_CLI_VERSION }}
+
+      # Authentication with retry mechanism for reliability
+      - name: Authenticate with Fabric CLI (with retry)
+        env:
+          CLIENT_ID: ${{ secrets.CLIENT_ID }}
+          CLIENT_SECRET: ${{ secrets.CLIENT_SECRET }}
+          TENANT_ID: ${{ secrets.TENANT_ID }}
+        run: |
+          set -e
+          fab config set encryption_fallback_enabled true
+          
+          # Retry authentication up to 3 times
+          for i in {1..3}; do
+            echo "🚀 Authentication attempt $i/3..."
+            if fab auth login -u "$CLIENT_ID" -p "$CLIENT_SECRET" --tenant "$TENANT_ID"; then
+              echo "✅ Authentication successful"
+              break
+            elif [[ $i -eq 3 ]]; then
+              echo "::error::❌ Authentication failed after 3 attempts"
+              exit 1
+            else
+              echo "⚠️ Authentication attempt $i failed, retrying in 5 seconds..."
+              sleep 5
+            fi
+          done
+
+      - name: Deploy Semantic Models
+        id: deploy-models
+        env:
+          WORKSPACE_NAME: ${{ vars.WORKSPACE_NAME }}
+          SEMANTIC_MODEL_FOLDERS: ${{ needs.validate-and-plan.outputs.semantic-models }}
+        run: |
+          set -e
+          echo "🚀 Deploying semantic models..."
+          
+          promoted_sm_ids=""
+          
+          for promote_path in $SEMANTIC_MODEL_FOLDERS; do
+            if [[ -n "$promote_path" ]]; then
+              echo "📊 Promoting semantic model: $promote_path"
+              echo "🌐 Endpoint: Fabric CLI - Importing semantic model via fabric import API"
+              
+              if ! fab import "/$WORKSPACE_NAME.Workspace/$promote_path" -i "$(pwd)/$promote_path" -f; then
+                echo "::error::❌ Failed to import semantic model: $promote_path"
+                exit 1
+              fi
+              
+              # Get the semantic model ID
+              sm_name=$(basename "$promote_path")
+              echo "🌐 Endpoint: Fabric CLI - Getting semantic model ID via fabric get API"
+              if sm_id=$(fab get "$WORKSPACE_NAME.Workspace/$sm_name" -q id); then
+                # Clean semantic model ID to remove any carriage returns or whitespace
+                sm_id=$(echo "$sm_id" | tr -d '\r\n' | xargs)
+                promoted_sm_ids="$promoted_sm_ids $sm_id"
+                echo "✅ Successfully deployed: $sm_name (ID: $sm_id)"
+              else
+                echo "::warning::⚠️ Could not retrieve ID for: $sm_name"
+              fi
+            fi
+          done
+          
+          promoted_sm_ids=$(echo "$promoted_sm_ids" | xargs)
+          echo "semantic-model-ids=$promoted_sm_ids" >> $GITHUB_OUTPUT
+          echo "📋 Promoted semantic model IDs: $promoted_sm_ids"
+
+      - name: Upload deployment artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: semantic-model-deployment-logs
+          path: |
+            ~/.fabric/
+            *.log
+
+  deploy-reports:
+    name: Deploy Reports
+    needs: [validate-and-plan, deploy-semantic-models]
+    if: needs.validate-and-plan.outputs.skip-deployment != 'true' && needs.validate-and-plan.outputs.reports != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    
+    steps:
+      - name: Check out the code
+        uses: actions/checkout@v4
+
+      # Use latest action versions for security and performance
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      # Cache dependencies to improve build performance
+      - name: Cache Python dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-fabric-cli
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install Fabric CLI
+        run: |
+          set -e
+          python -m pip install --upgrade pip
+          python -m pip install ${{ env.FABRIC_CLI_VERSION }}
+
+      # Authentication with retry mechanism for reliability
+      - name: Authenticate with Fabric CLI (with retry)
+        env:
+          CLIENT_ID: ${{ secrets.CLIENT_ID }}
+          CLIENT_SECRET: ${{ secrets.CLIENT_SECRET }}
+          TENANT_ID: ${{ secrets.TENANT_ID }}
+        run: |
+          set -e
+          fab config set encryption_fallback_enabled true
+          
+          # Retry authentication up to 3 times
+          for i in {1..3}; do
+            echo "🚀 Authentication attempt $i/3..."
+            if fab auth login -u "$CLIENT_ID" -p "$CLIENT_SECRET" --tenant "$TENANT_ID"; then
+              echo "✅ Authentication successful"
+              break
+            elif [[ $i -eq 3 ]]; then
+              echo "::error::❌ Authentication failed after 3 attempts"
+              exit 1
+            else
+              echo "⚠️ Authentication attempt $i failed, retrying in 5 seconds..."
+              sleep 5
+            fi
+          done
+
+      - name: Deploy Reports
+        env:
+          WORKSPACE_NAME: ${{ vars.WORKSPACE_NAME }}
+          WORKSPACE_ID: ${{ needs.validate-and-plan.outputs.workspace-id }}
+          REPORT_FOLDERS: ${{ needs.validate-and-plan.outputs.reports }}
+        run: |
+          set -e
+          echo "📊 Deploying reports..."
+          
+          for promote_path in $REPORT_FOLDERS; do
+            if [[ -n "$promote_path" ]]; then
+              echo "📈 Processing report: $promote_path"
+              
+              def_file=$(find "$promote_path" -name "definition.pbir" -type f)
+              if [[ -z "$def_file" ]]; then
+                echo "::error::❌ definition.pbir not found in $promote_path"
+                continue
+              fi
+
+              echo "🔍 Processing report definition: $def_file"
+
+              # Check connection type and handle accordingly
+              connection_type=$(python3 -c "
+          import json
+          import sys
+          try:
+              with open('$def_file', 'r') as f:
+                  data = json.load(f)
+              dataset_ref = data.get('datasetReference', {})
+              if 'byConnection' in dataset_ref:
+                  print('byConnection')
+              elif 'byPath' in dataset_ref:
+                  print('byPath')
+              else:
+                  print('none')
+          except Exception as e:
+              print('error', file=sys.stderr)
+              sys.exit(1)
+          ")
+
+              if [[ "$connection_type" == "byPath" ]]; then
+                echo "🔗 Converting byPath reference to byConnection..."
+                
+                # Get semantic model path and convert to connection string
+                semantic_model_path=$(python3 -c "
+          import json
+          try:
+              with open('$def_file', 'r') as f:
+                  data = json.load(f)
+              bypath = data.get('datasetReference', {}).get('byPath')
+              if bypath:
+                  print(bypath.get('path', ''))
+          except:
+              pass
+          ")
+
+                if [[ -n "$semantic_model_path" ]]; then
+                  semantic_model_name=$(basename "$semantic_model_path")
+                  
+                  echo "🌐 Endpoint: Fabric CLI - Getting semantic model ID for report linkage via fabric get API"
+                  if semantic_model_id=$(fab get "$WORKSPACE_NAME.Workspace/$semantic_model_name" -q id); then
+                    # Clean semantic model ID to remove any carriage returns or whitespace
+                    semantic_model_id=$(echo "$semantic_model_id" | tr -d '\r\n' | xargs)
+                    echo "✅ Found semantic model: $semantic_model_name (ID: $semantic_model_id)"
+                    
+                    # Update definition to use byConnection
+                    WORKSPACE_NAME="$WORKSPACE_NAME" SEMANTIC_MODEL_ID="$semantic_model_id" python3 -c "
+          import json
+          import os
+          
+          workspace_name = os.environ.get('WORKSPACE_NAME')
+          semantic_id = os.environ.get('SEMANTIC_MODEL_ID')
+          
+          try:
+              with open('$def_file', 'r') as f:
+                  data = json.load(f)
+              
+              data['datasetReference'] = {
+                  'byConnection': {
+                      'connectionString': f'Data Source=powerbi://api.powerbi.com/v1.0/myorg/{workspace_name};initial catalog=SampleModel;access mode=readonly;integrated security=ClaimsToken;semanticmodelid={semantic_id}'
+                  }
+              }
+              
+              with open('$def_file', 'w') as f:
+                  json.dump(data, f, indent=2)
+              print('✅ Updated definition.pbir to use byConnection')
+          except Exception as e:
+              print(f'❌ Error updating definition.pbir: {e}')
+              exit(1)
+          "
+                  else
+                    echo "::error::❌ Could not retrieve semantic model ID for: $semantic_model_name"
+                    continue
+                  fi
+                fi
+              fi
+
+              # Import the report
+              echo "📊 Importing report to workspace..."
+              echo "🌐 Endpoint: Fabric CLI - Importing report via fabric import API"
+              if ! fab import "/$WORKSPACE_NAME.Workspace/$promote_path" -i "$(pwd)/$promote_path" -f; then
+                echo "::error::❌ Failed to import report: $promote_path"
+                exit 1
+              fi
+              
+              echo "✅ Successfully deployed report: $promote_path"
+            fi
+          done
+
+      - name: Upload deployment artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: report-deployment-logs
+          path: |
+            ~/.fabric/
+            *.log
+
+  refresh-and-validate:
+    name: Refresh Data and Validate
+    needs: [validate-and-plan, deploy-semantic-models, deploy-reports]
+    if: |
+      always() && 
+      needs.validate-and-plan.outputs.skip-deployment != 'true' && 
+      (needs.deploy-semantic-models.result == 'success' || needs.deploy-semantic-models.result == 'skipped')
+    runs-on: ubuntu-latest
+    timeout-minutes: 45  # Extended timeout for data refresh operations
+    
+    steps:
+      # Use latest action versions for security and performance
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      # Cache dependencies to improve build performance
+      - name: Cache Python dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-fabric-cli
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install Fabric CLI
+        run: |
+          set -e
+          python -m pip install --upgrade pip
+          python -m pip install ${{ env.FABRIC_CLI_VERSION }}
+
+      # Authentication with retry mechanism for reliability
+      - name: Authenticate with Fabric CLI (with retry)
+        env:
+          CLIENT_ID: ${{ secrets.CLIENT_ID }}
+          CLIENT_SECRET: ${{ secrets.CLIENT_SECRET }}
+          TENANT_ID: ${{ secrets.TENANT_ID }}
+        run: |
+          set -e
+          fab config set encryption_fallback_enabled true
+          
+          # Retry authentication up to 3 times
+          for i in {1..3}; do
+            echo "🚀 Authentication attempt $i/3..."
+            if fab auth login -u "$CLIENT_ID" -p "$CLIENT_SECRET" --tenant "$TENANT_ID"; then
+              echo "✅ Authentication successful"
+              break
+            elif [[ $i -eq 3 ]]; then
+              echo "::error::❌ Authentication failed after 3 attempts"
+              exit 1
+            else
+              echo "⚠️ Authentication attempt $i failed, retrying in 5 seconds..."
+              sleep 5
+            fi
+          done
+
+      - name: Trigger Data Refresh
+        env:
+          WORKSPACE_ID: ${{ needs.validate-and-plan.outputs.workspace-id }}
+          SEMANTIC_MODEL_IDS: ${{ needs.deploy-semantic-models.outputs.semantic-model-ids }}
+        run: |
+          set -e
+          echo "🔄 Starting data refresh process..."
+          
+          if [[ -z "$SEMANTIC_MODEL_IDS" ]]; then
+            echo "ℹ️ No semantic models to refresh"
+            exit 0
+          fi
+          
+          for semantic_model_id in $SEMANTIC_MODEL_IDS; do
+            if [[ -n "$semantic_model_id" ]]; then
+              # Clean semantic model ID to remove any carriage returns or whitespace
+              semantic_model_id=$(echo "$semantic_model_id" | tr -d '\r\n' | xargs)
+              
+              echo "🔄 Triggering refresh for semantic model: $semantic_model_id"
+              echo "🌐 Endpoint: POST https://api.powerbi.com/v1.0/myorg/groups/$WORKSPACE_ID/datasets/$semantic_model_id/refreshes"
+              echo "🌐 Action: Triggering dataset refresh"
+
+              if fab api -X post -A powerbi "groups/$WORKSPACE_ID/datasets/$semantic_model_id/refreshes"; then
+                echo "✅ Refresh request submitted for: $semantic_model_id"
+              else
+                echo "::warning::⚠️ Refresh request failed for: $semantic_model_id"
+              fi
+            fi
+          done
+
+      - name: TBD - Data Quality Validation Placeholder
+        env:
+          SEMANTIC_MODEL_IDS: ${{ needs.deploy-semantic-models.outputs.semantic-model-ids }}
+        run: |
+          echo "🧪 TBD - Data Quality Validation Phase"
+          echo "================================================"
+          echo "This is where comprehensive data quality tests would run:"
+          echo ""
+          
+          for semantic_model_id in $SEMANTIC_MODEL_IDS; do
+            if [[ -n "$semantic_model_id" ]]; then
+              echo "  📊 Semantic Model: $semantic_model_id"
+              echo "    ✓ Schema validation tests"
+              echo "    ✓ Data completeness checks"
+              echo "    ✓ Business rule validation"
+              echo "    ✓ Performance benchmarks"
+              echo "    ✓ Relationship integrity tests"
+              echo ""
+            fi
+          done
+          
+          echo "💡 Implement actual DQV testing using your preferred framework"
+          echo "   (Great Expectations, dbt tests, custom validation scripts, etc.)"
+
+      - name: Upload refresh logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: refresh-and-validation-logs
+          path: |
+            ~/.fabric/
+            *.log
+
+  # Comprehensive deployment summary for tracking and monitoring
+  deployment-summary:
+    name: Deployment Summary
+    needs: [validate-and-plan, deploy-semantic-models, deploy-reports, refresh-and-validate]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate Summary
+        run: |
+          echo "## 📊 Fabric Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Workspace:** ${{ vars.WORKSPACE_NAME }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Trigger:** ${{ github.event_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Run ID:** ${{ github.run_id }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Commit:** \`${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Job status summary
+          echo "### Job Results:" >> $GITHUB_STEP_SUMMARY
+          echo "- **Validation:** ${{ needs.validate-and-plan.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Semantic Models:** ${{ needs.deploy-semantic-models.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Reports:** ${{ needs.deploy-reports.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Refresh & Validate:** ${{ needs.refresh-and-validate.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [[ "${{ needs.validate-and-plan.outputs.skip-deployment }}" == "true" ]]; then
+            echo "✨ **No changes detected** - deployment was skipped" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "### 🚀 Deployed Items:" >> $GITHUB_STEP_SUMMARY
+            if [[ -n "${{ needs.validate-and-plan.outputs.semantic-models }}" ]]; then
+              echo "- 📈 **Semantic Models:** \`${{ needs.validate-and-plan.outputs.semantic-models }}\`" >> $GITHUB_STEP_SUMMARY
+            fi
+            if [[ -n "${{ needs.validate-and-plan.outputs.reports }}" ]]; then
+              echo "- 📊 **Reports:** \`${{ needs.validate-and-plan.outputs.reports }}\`" >> $GITHUB_STEP_SUMMARY
+            fi
+            
+            if [[ -n "${{ needs.deploy-semantic-models.outputs.semantic-model-ids }}" ]]; then
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "### 📋 Semantic Model IDs:" >> $GITHUB_STEP_SUMMARY
+              echo "\`${{ needs.deploy-semantic-models.outputs.semantic-model-ids }}\`" >> $GITHUB_STEP_SUMMARY
+            fi
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "*Generated on $(date -u '+%Y-%m-%d %H:%M:%S UTC')*" >> $GITHUB_STEP_SUMMARY
